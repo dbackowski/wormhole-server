@@ -13,8 +13,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"wormhole-server/pkg/tunnel"
+
+	"github.com/gorilla/websocket"
 )
 
 var upgrader = websocket.Upgrader{
@@ -30,10 +31,17 @@ type Server struct {
 }
 
 type Client struct {
-	conn     *websocket.Conn
-	tunnel   *tunnel.Tunnel
-	requests map[string]chan *tunnel.Message
-	mutex    sync.RWMutex
+	conn       *websocket.Conn
+	tunnel     *tunnel.Tunnel
+	requests   map[string]chan *tunnel.Message
+	mutex      sync.RWMutex
+	writeMutex sync.Mutex // Protects WebSocket writes
+	requestQueue chan *QueuedRequest // Queue for handling concurrent requests
+}
+
+type QueuedRequest struct {
+	msg      *tunnel.Message
+	respChan chan *tunnel.Message
 }
 
 func NewServer() *Server {
@@ -103,10 +111,10 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Server WebSocket: Processing request: %s %s", msg.Method, msg.URL)
 			go s.handleClientRequest(client, &msg)
 		} else {
-			log.Printf("Server WebSocket: Handling response message")
+			log.Printf("Server WebSocket: Handling response message for ID: %s, status: %d", msg.ID, msg.Status)
 			client.mutex.RLock()
 			if respChan, exists := client.requests[msg.ID]; exists {
-				log.Printf("Server WebSocket: Found pending request, sending response")
+				log.Printf("Server WebSocket: Found pending request, sending response to HTTP handler")
 				respChan <- &msg
 			} else {
 				log.Printf("Server WebSocket: No pending request found for ID: %s", msg.ID)
@@ -131,12 +139,14 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	subdomain := parts[0]
+	log.Printf("Server HTTP: Received request %s %s from %s (Host: %s)", r.Method, r.URL.RequestURI(), r.RemoteAddr, r.Host)
 
 	s.clientsMutex.RLock()
 	client, exists := s.clients[subdomain]
 	s.clientsMutex.RUnlock()
 
 	if !exists {
+		log.Printf("Server HTTP: Tunnel not found for subdomain: %s", subdomain)
 		http.Error(w, "Tunnel not found", http.StatusNotFound)
 		return
 	}
@@ -157,14 +167,27 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	client.requests[requestID] = make(chan *tunnel.Message, 1)
 	client.mutex.Unlock()
 
+	log.Printf("Server HTTP: Sending request to client via WebSocket: %s %s (ID: %s)", msg.Method, msg.URL, requestID)
+
+	// Use a mutex to prevent concurrent WebSocket writes which can cause corruption
+	client.writeMutex.Lock()
+	client.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	err = client.conn.WriteJSON(msg)
+	client.writeMutex.Unlock()
 	if err != nil {
+		log.Printf("Server HTTP: Failed to send WebSocket message: %v", err)
+		// Clean up the request channel on failure
+		client.mutex.Lock()
+		delete(client.requests, requestID)
+		client.mutex.Unlock()
 		http.Error(w, "Failed to forward request", http.StatusInternalServerError)
 		return
 	}
+	log.Printf("Server HTTP: Request sent to client, waiting for response...")
 
 	select {
 	case response := <-client.requests[requestID]:
+		log.Printf("Server HTTP: Received response from client: status %d, body length %d", response.Status, len(response.Body))
 		client.mutex.Lock()
 		delete(client.requests, requestID)
 		client.mutex.Unlock()
@@ -174,8 +197,10 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(response.Status)
 		w.Write(response.Body)
+		log.Printf("Server HTTP: Response sent to browser: status %d", response.Status)
 
-	case <-time.After(30 * time.Second):
+	case <-time.After(15 * time.Second):
+		log.Printf("Server HTTP: Request %s timed out after 15 seconds", requestID)
 		client.mutex.Lock()
 		delete(client.requests, requestID)
 		client.mutex.Unlock()
@@ -191,8 +216,16 @@ func (s *Server) handleClientRequest(client *Client, msg *tunnel.Message) {
 		localURL = "http://localhost:3000"
 	}
 
-	fullURL := strings.TrimSuffix(localURL, "/") + msg.URL
-	log.Printf("Server: Making request to: %s", fullURL)
+	// Better URL construction to handle various path formats
+	var fullURL string
+	if strings.HasPrefix(msg.URL, "/") {
+		// Absolute path - just append to base URL
+		fullURL = strings.TrimSuffix(localURL, "/") + msg.URL
+	} else {
+		// Relative path - ensure proper joining
+		fullURL = strings.TrimSuffix(localURL, "/") + "/" + msg.URL
+	}
+	log.Printf("Server: Original URL: %s -> Local URL: %s", msg.URL, fullURL)
 
 	var body io.Reader
 	if len(msg.Body) > 0 {
@@ -261,7 +294,11 @@ func (s *Server) handleClientRequest(client *Client, msg *tunnel.Message) {
 		Body:    respBody,
 	}
 
+	// Use write mutex for WebSocket response as well
+	client.writeMutex.Lock()
+	client.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	err = client.conn.WriteJSON(response)
+	client.writeMutex.Unlock()
 	if err != nil {
 		log.Printf("Server: Failed to send response: %v", err)
 	}

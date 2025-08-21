@@ -52,11 +52,15 @@ func HTTPRequestToMessage(req *http.Request, id string) *Message {
 		}
 	}
 
+	// Use RequestURI() to preserve the original request path with query parameters
+	// and fragments, which is crucial for asset loading
+	url := req.URL.RequestURI()
+
 	return &Message{
 		Type:    "request",
 		ID:      id,
 		Method:  req.Method,
-		URL:     req.URL.String(),
+		URL:     url,
 		Headers: headers,
 	}
 }
