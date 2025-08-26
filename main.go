@@ -31,11 +31,11 @@ type Server struct {
 }
 
 type Client struct {
-	conn       *websocket.Conn
-	tunnel     *tunnel.Tunnel
-	requests   map[string]chan *tunnel.Message
-	mutex      sync.RWMutex
-	writeMutex sync.Mutex // Protects WebSocket writes
+	conn         *websocket.Conn
+	tunnel       *tunnel.Tunnel
+	requests     map[string]chan *tunnel.Message
+	mutex        sync.RWMutex
+	writeMutex   sync.Mutex          // Protects WebSocket writes
 	requestQueue chan *QueuedRequest // Queue for handling concurrent requests
 }
 
@@ -249,9 +249,14 @@ func (s *Server) handleClientRequest(client *Client, msg *tunnel.Message) {
 	}
 
 	for key, value := range msg.Headers {
-		if strings.ToLower(key) != "host" {
+		if strings.ToLower(key) != "host" && strings.ToLower(key) != "origin" {
 			req.Header.Set(key, value)
 		}
+	}
+
+	// Set Origin header to match the local URL to avoid CSRF protection issues
+	if localURL != "" {
+		req.Header.Set("Origin", localURL)
 	}
 
 	httpClient := &http.Client{}
